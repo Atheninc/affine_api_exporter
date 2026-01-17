@@ -39,7 +39,7 @@ function sshConnect() {
 
     if (keyPath) {
       cfg.privateKey = fs.readFileSync(keyPath);
-      if (password) cfg.passphrase = password; // si clé chiffrée
+      if (password) cfg.passphrase = password; // clé chiffrée
     } else {
       cfg.password = password;
     }
@@ -75,7 +75,7 @@ async function psqlQuery(conn, sql) {
   return stdout.trim();
 }
 
-/* ---------------- YJS -> JSON-like ---------------- */
+/* ---------------- YJS -> JSON-like (improved) ---------------- */
 
 function yValueToJS(v) {
   if (v == null) return v;
@@ -97,6 +97,11 @@ function yValueToJS(v) {
   if (v instanceof Y.Text) {
     return v.toString();
   }
+
+  // Yjs XML types (often used by rich text editors)
+  if (v instanceof Y.XmlText) return v.toString();
+  if (v instanceof Y.XmlFragment) return v.toString();
+  if (v instanceof Y.XmlElement) return v.toString();
 
   if (typeof v?.toArray === "function") {
     try {
@@ -132,7 +137,6 @@ function findRootPageBlock(blocks) {
 }
 
 function findFirstNoteBlock(blocks) {
-  // souvent utile en mode edgeless
   for (const [bid, b] of Object.entries(blocks)) {
     if (b && b["sys:flavour"] === "affine:note") return bid;
   }
@@ -158,10 +162,10 @@ function orderedBlockIds(blocks, rootId) {
   return ordered;
 }
 
-/* ---------------- Deep string extraction (surface) ---------------- */
+/* ---------------- Deep string extraction utilities ---------------- */
 
 function collectStringsDeep(obj, out, path = "", depth = 0) {
-  if (depth > 10) return; // anti-boucle
+  if (depth > 10) return;
   if (obj == null) return;
 
   if (typeof obj === "string") {
@@ -182,17 +186,41 @@ function collectStringsDeep(obj, out, path = "", depth = 0) {
   }
 }
 
+function findTextLikeFields(obj, hits = [], path = "", depth = 0) {
+  if (depth > 12) return hits;
+  if (!obj) return hits;
+
+  if (typeof obj === "string") {
+    const s = obj.trim();
+    if (s && s !== ".") hits.push({ path, value: s });
+    return hits;
+  }
+
+  if (Array.isArray(obj)) {
+    obj.forEach((v, i) => findTextLikeFields(v, hits, `${path}[${i}]`, depth + 1));
+    return hits;
+  }
+
+  if (typeof obj === "object") {
+    for (const [k, v] of Object.entries(obj)) {
+      findTextLikeFields(v, hits, path ? `${path}.${k}` : k, depth + 1);
+    }
+  }
+
+  return hits;
+}
+
+/* ---------------- SURFACE summary ---------------- */
+
 function getSurfaceSummary(block) {
   const val = block?.["prop:elements"]?.value;
   if (!val) return { count: 0, texts: [] };
 
-  // best effort count
   let count = 0;
   if (Array.isArray(val?.elements)) count = val.elements.length;
   else if (Array.isArray(val)) count = val.length;
   else if (typeof val === "object") count = Object.keys(val).length;
 
-  // extract strings
   const found = [];
   collectStringsDeep(val, found);
 
@@ -209,13 +237,48 @@ function getSurfaceSummary(block) {
   return { count, texts: uniq };
 }
 
+/* ---------------- Paragraph extraction (improved) ---------------- */
+
+function extractParagraphText(block) {
+  // 1) legacy simple text
+  if (typeof block?.["prop:text"] === "string") return block["prop:text"];
+
+  // 2) if it's an object, try to convert via yValueToJS
+  const maybe = block?.["prop:text"];
+  if (maybe && typeof maybe === "object") {
+    const as = yValueToJS(maybe);
+    if (typeof as === "string") return as;
+  }
+
+  // 3) common richer fields
+  const candidates = [
+    "prop:richText",
+    "prop:delta",
+    "prop:content",
+    "prop:markdown",
+    "prop:html",
+    "prop:source",
+    "prop:elements",
+  ];
+
+  for (const k of candidates) {
+    if (!block?.[k]) continue;
+    const as = yValueToJS(block[k]);
+    if (typeof as === "string" && as.trim()) return as;
+  }
+
+  // 4) last resort: deep scan for any meaningful string
+  const hits = [];
+  collectStringsDeep(block, hits);
+  const first = hits.map(x => x.text).find(s => s && s !== ".");
+  return first || "";
+}
+
 /* ---------------- Blocks -> Markdown ---------------- */
 
 function blocksToMarkdown(blocks) {
-  // Root: page si possible, sinon fallback note (edgeless)
   let rootId = findRootPageBlock(blocks);
 
-  // fallback si page sans children (souvent edgeless)
   if (rootId) {
     const rootChildren = blocks[rootId]?.["sys:children"];
     const hasChildren = Array.isArray(rootChildren) && rootChildren.length > 0;
@@ -230,7 +293,6 @@ function blocksToMarkdown(blocks) {
 
   let pageTitle = "Untitled";
   if (rootId) {
-    // si on part d'une note, pas de titre -> fallback
     const maybeTitle = blocks[rootId]?.["prop:title"];
     if (typeof maybeTitle === "string" && maybeTitle.trim()) pageTitle = maybeTitle.trim();
   }
@@ -239,7 +301,7 @@ function blocksToMarkdown(blocks) {
     return {
       title: "Untitled",
       markdown: "_No affine:page / affine:note root found_",
-      debug: { blocksCount: Object.keys(blocks).length }
+      debug: { blocksCount: Object.keys(blocks).length },
     };
   }
 
@@ -250,7 +312,6 @@ function blocksToMarkdown(blocks) {
     const b = blocks[bid] || {};
     const flavour = b["sys:flavour"];
 
-    // NOTE: afficher un petit header (structure edgeless)
     if (flavour === "affine:note") {
       const idx = b["prop:index"] ?? "";
       const xywh = b["prop:xywh"] ?? "";
@@ -262,7 +323,6 @@ function blocksToMarkdown(blocks) {
       continue;
     }
 
-    // SURFACE: afficher résumé + textes trouvés si présents
     if (flavour === "affine:surface") {
       const { count, texts } = getSurfaceSummary(b);
       lines.push("---");
@@ -279,13 +339,9 @@ function blocksToMarkdown(blocks) {
       continue;
     }
 
-    // PARAGRAPH: ton comportement existant
     if (flavour === "affine:paragraph") {
-      const txt = b["prop:text"];
-      if (typeof txt === "string") {
-        const t = txt.trim();
-        if (t && t !== ".") lines.push(t, "");
-      }
+      const t = (extractParagraphText(b) || "").trim();
+      if (t && t !== ".") lines.push(t, "");
       continue;
     }
   }
@@ -296,8 +352,8 @@ function blocksToMarkdown(blocks) {
     debug: {
       rootId,
       orderedCount: ordered.length,
-      blocksCount: Object.keys(blocks).length
-    }
+      blocksCount: Object.keys(blocks).length,
+    },
   };
 }
 
@@ -307,9 +363,17 @@ function findPageRefs(blocks) {
   const refs = [];
 
   const directKeys = [
-    "pageId", "docId", "refId",
-    "prop:pageId", "prop:docId", "prop:reference", "prop:ref", "prop:linkedPageId",
-    "prop:sourceId", "prop:targetId", "prop:targetPageId"
+    "pageId",
+    "docId",
+    "refId",
+    "prop:pageId",
+    "prop:docId",
+    "prop:reference",
+    "prop:ref",
+    "prop:linkedPageId",
+    "prop:sourceId",
+    "prop:targetId",
+    "prop:targetPageId",
   ];
 
   for (const [id, b] of Object.entries(blocks)) {
@@ -325,7 +389,6 @@ function findPageRefs(blocks) {
       }
     }
 
-    // scan des sous-objets
     for (const [k, v] of Object.entries(b)) {
       if (!v || typeof v !== "object" || Array.isArray(v)) continue;
       for (const [kk, vv] of Object.entries(v)) {
@@ -337,7 +400,6 @@ function findPageRefs(blocks) {
       }
     }
 
-    // scan basique de strings "affine://" ou similaire
     for (const [k, v] of Object.entries(b)) {
       if (typeof v === "string" && v.startsWith("affine://")) {
         refs.push({ block_id: id, flavour, type, key: k, value: v });
@@ -345,7 +407,6 @@ function findPageRefs(blocks) {
     }
   }
 
-  // dédoublonne
   const seen = new Set();
   const out = [];
   for (const r of refs) {
@@ -360,7 +421,6 @@ function findPageRefs(blocks) {
 /* ---------------- Snapshot fetcher ---------------- */
 
 async function fetchSnapshotBlobBase64(conn, wid, pid) {
-  // snapshots.guid == workspace_pages.page_id
   return await psqlQuery(
     conn,
     `SELECT encode(blob,'base64')
@@ -378,10 +438,7 @@ app.get("/api/workspaces", async (_req, res) => {
   let conn;
   try {
     conn = await sshConnect();
-    const raw = await psqlQuery(
-      conn,
-      "SELECT id, name, created_at FROM workspaces ORDER BY created_at DESC;"
-    );
+    const raw = await psqlQuery(conn, "SELECT id, name, created_at FROM workspaces ORDER BY created_at DESC;");
 
     const workspaces = raw
       ? raw.split("\n").map(line => {
@@ -446,7 +503,7 @@ app.get("/api/workspaces/:wid/pages/:pid/content", async (req, res) => {
       bytes: blobBytes.length,
       title: decoded.title,
       markdown: decoded.markdown,
-      debug: decoded.debug
+      debug: decoded.debug,
     });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
@@ -478,7 +535,37 @@ app.get("/api/workspaces/:wid/pages/:pid/raw", async (req, res) => {
       root_page_block: root,
       ordered_block_ids: ordered,
       refs,
-      blocks
+      blocks,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    if (conn) conn.end();
+  }
+});
+
+// DEBUG: inspect a specific block and find hidden/rich text
+app.get("/api/workspaces/:wid/pages/:pid/block/:bid", async (req, res) => {
+  let conn;
+  try {
+    conn = await sshConnect();
+    const { wid, pid, bid } = req.params;
+
+    const b64 = await fetchSnapshotBlobBase64(conn, wid, pid);
+    if (!b64) return res.status(404).json({ error: "No snapshot found" });
+
+    const blocks = decodeSnapshotToBlocks(Buffer.from(b64, "base64"));
+    const block = blocks[bid];
+    if (!block) return res.status(404).json({ error: "Block not found" });
+
+    const hits = findTextLikeFields(block);
+    res.json({
+      workspace_id: wid,
+      page_id: pid,
+      block_id: bid,
+      keys: Object.keys(block),
+      text_hits: hits.slice(0, 200),
+      block,
     });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
