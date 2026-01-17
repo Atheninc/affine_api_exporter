@@ -1,0 +1,63 @@
+# ======================
+# Node.js
+# ======================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ======================
+# Environnement
+# ======================
+.env
+.env.*
+!.env.example
+
+# ======================
+# Logs
+# ======================
+logs/
+*.log
+
+# ======================
+# OS / Editor
+# ======================
+.DS_Store
+Thumbs.db
+
+# Windows
+Desktop.ini
+
+# VS Code
+.vscode/
+!.vscode/extensions.json
+
+# JetBrains
+.idea/
+
+# ======================
+# Build / Runtime
+# ======================
+dist/
+build/
+coverage/
+
+# ======================
+# Temporary / Cache
+# ======================
+.tmp/
+.cache/
+.temp/
+
+# ======================
+# Public generated files (optionnel)
+# ======================
+public/*.map
+
+# ======================
+# SSH keys (sécurité)
+# ======================
+*.pem
+*.key
+*.ppk

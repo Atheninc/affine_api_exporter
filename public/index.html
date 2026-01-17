@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AFFiNE Navigator</title>
+
+  <style>
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      margin: 20px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 320px 420px 1fr;
+      gap: 16px;
+    }
+    .panel {
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      padding: 12px;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    input {
+      width: 100%;
+      padding: 8px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+    }
+    button {
+      padding: 8px 10px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    ul {
+      list-style: none;
+      padding: 0;
+      margin: 8px 0 0;
+    }
+    li {
+      padding: 6px 8px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    li:hover { background: #f5f5f5; }
+    li.active { background: #e9f2ff; }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #0b1020;
+      color: #e9eefc;
+      padding: 12px;
+      border-radius: 10px;
+      overflow: auto;
+    }
+    .muted {
+      color: #666;
+      font-size: 12px;
+    }
+    .title {
+      font-weight: 600;
+      margin: 0 0 4px;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>AFFiNE Navigator</h2>
+  <p class="muted">
+    Workspaces → pages → contenu<br>
+    <strong>Inspecteur :</strong> blocs non parsés, notes, surface, paragraphes ignorés
+  </p>
+
+  <div class="grid">
+    <div class="panel">
+      <button id="btnLoadWs">Workspaces</button>
+      <ul id="wsList"></ul>
+    </div>
+
+    <div class="panel">
+      <input id="pageFilter" placeholder="Filtrer pages…" />
+      <div class="muted" id="pagesMeta"></div>
+      <ul id="pagesList"></ul>
+    </div>
+
+    <div class="panel">
+      <div class="title" id="contentTitle">Contenu</div>
+      <div class="muted" id="contentMeta"></div>
+      <pre id="contentBox">Clique un workspace puis une page…</pre>
+    </div>
+  </div>
+
+<script>
+/* ===================== DOM ===================== */
+
+const wsList = document.getElementById("wsList");
+const pagesList = document.getElementById("pagesList");
+const pagesMeta = document.getElementById("pagesMeta");
+const pageFilter = document.getElementById("pageFilter");
+const contentBox = document.getElementById("contentBox");
+const contentTitle = document.getElementById("contentTitle");
+const contentMeta = document.getElementById("contentMeta");
+
+/* ===================== STATE ===================== */
+
+let currentWs = null;
+let currentPage = null;
+let allPages = [];
+
+/* ===================== DEBUG ===================== */
+
+const PARSED_FLAVOURS = new Set([
+  "affine:page",
+  "affine:paragraph"
+]);
+
+function summarizeBlock(b) {
+  return {
+    flavour: b?.["sys:flavour"],
+    type: b?.["prop:type"],
+    text:
+      typeof b?.["prop:text"] === "string"
+        ? b["prop:text"].replace(/\s+/g, " ").slice(0, 120)
+        : undefined,
+    children: Array.isArray(b?.["sys:children"])
+      ? b["sys:children"].length
+      : 0,
+    keys: Object.keys(b || {}).slice(0, 15)
+  };
+}
+
+function analyzeRaw(raw) {
+  const blocks = raw.blocks || {};
+  const ordered = raw.ordered_block_ids || [];
+  const ids = ordered.length ? ordered : Object.keys(blocks);
+
+  const flavours = new Map();
+  const unparsed = [];
+  const ignored = [];
+
+  for (const id of ids) {
+    const b = blocks[id];
+    const flavour = b?.["sys:flavour"] || "(missing)";
+    flavours.set(flavour, (flavours.get(flavour) || 0) + 1);
+
+    if (flavour === "affine:paragraph") {
+      const t = b?.["prop:text"];
+      if (typeof t !== "string" || !t.trim() || t.trim() === ".") {
+        ignored.push({ id, text: t });
+      }
+      continue;
+    }
+
+    if (!PARSED_FLAVOURS.has(flavour)) {
+      unparsed.push({ id, summary: summarizeBlock(b), full: b });
+    }
+  }
+
+  console.groupCollapsed(
+    "%cAFFiNE • analyse page",
+    "font-weight:600",
+    {
+      rootId: raw.root_page_block,
+      blocks: Object.keys(blocks).length,
+      ordered: ordered.length
+    }
+  );
+
+  console.groupCollapsed("flavours");
+  console.table([...flavours.entries()].map(([f, c]) => ({ flavour: f, count: c })));
+  console.groupEnd();
+
+  console.groupCollapsed(`blocs non parsés (${unparsed.length})`);
+  console.table(unparsed.map(x => ({
+    id: x.id,
+    flavour: x.summary.flavour,
+    children: x.summary.children,
+    text: x.summary.text
+  })));
+  unparsed.forEach(x => console.log("UNPARSED", x.id, x.full));
+  console.groupEnd();
+
+  console.groupCollapsed(`paragraphes ignorés (${ignored.length})`);
+  console.table(ignored);
+  console.groupEnd();
+
+  if (raw.refs?.length) {
+    console.groupCollapsed(`refs (${raw.refs.length})`);
+    console.table(raw.refs);
+    console.groupEnd();
+  }
+
+  console.groupEnd();
+}
+
+/* ===================== API ===================== */
+
+async function loadWorkspaces() {
+  wsList.innerHTML = "<li>Chargement…</li>";
+  const r = await fetch("/api/workspaces");
+  const j = await r.json();
+  wsList.innerHTML = "";
+
+  j.workspaces.forEach(ws => {
+    const li = document.createElement("li");
+    li.textContent = `${ws.name} (${ws.id.slice(0, 8)}…)`;
+    li.onclick = () => selectWorkspace(ws.id, li);
+    wsList.appendChild(li);
+  });
+}
+
+async function selectWorkspace(wid, liEl) {
+  [...wsList.children].forEach(li => li.classList.remove("active"));
+  liEl.classList.add("active");
+
+  currentWs = wid;
+  contentTitle.textContent = "Contenu";
+  contentMeta.textContent = "";
+  contentBox.textContent = "Chargement des pages…";
+
+  const r = await fetch(`/api/workspaces/${wid}/pages`);
+  const j = await r.json();
+
+  allPages = j.pages || [];
+  pagesMeta.textContent = `${allPages.length} page(s)`;
+  renderPages(allPages);
+}
+
+function renderPages(pages) {
+  pagesList.innerHTML = "";
+  pages.forEach(p => {
+    const li = document.createElement("li");
+    li.textContent = p.title || `(sans titre) ${p.page_id}`;
+    li.onclick = () => selectPage(p.page_id, li);
+    pagesList.appendChild(li);
+  });
+}
+
+async function selectPage(pid, liEl) {
+  [...pagesList.children].forEach(li => li.classList.remove("active"));
+  liEl.classList.add("active");
+
+  contentBox.textContent = "Chargement du contenu…";
+
+  const [rContent, rRaw] = await Promise.all([
+    fetch(`/api/workspaces/${currentWs}/pages/${pid}/content`),
+    fetch(`/api/workspaces/${currentWs}/pages/${pid}/raw`)
+  ]);
+
+  const content = await rContent.json();
+  const raw = await rRaw.json();
+
+  if (content.error) {
+    contentTitle.textContent = "Erreur";
+    contentBox.textContent = content.error;
+    return;
+  }
+
+  contentTitle.textContent = content.title || pid;
+  contentMeta.textContent = `page_id=${pid} • blob=${content.bytes} bytes`;
+  contentBox.textContent = content.markdown || "";
+
+  analyzeRaw(raw);
+}
+
+/* ===================== FILTER ===================== */
+
+pageFilter.addEventListener("input", () => {
+  const q = pageFilter.value.trim().toLowerCase();
+  if (!q) return renderPages(allPages);
+  renderPages(
+    allPages.filter(
+      p =>
+        (p.title || "").toLowerCase().includes(q) ||
+        p.page_id.includes(q)
+    )
+  );
+});
+
+/* ===================== START ===================== */
+
+document.getElementById("btnLoadWs").onclick = loadWorkspaces;
+loadWorkspaces();
+</script>
+
+</body>
+</html>
