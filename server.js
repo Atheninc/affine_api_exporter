@@ -12,6 +12,10 @@ app.use(express.static("public"));
 
 const PORT = Number(process.env.PORT || 8080);
 
+// Active le dump des blocks inconnus dans /content
+const DUMP_UNKNOWN_FLAVOURS =
+  String(process.env.DUMP_UNKNOWN_FLAVOURS || "false").toLowerCase() === "true";
+
 /* ---------------- SSH / DOCKER ---------------- */
 
 function dockerPrefix() {
@@ -167,6 +171,15 @@ function orderedBlockIds(blocks, rootId) {
 
 /* ---------------- Deep scan utilities ---------------- */
 
+function isMeaningfulText(t) {
+  if (!t) return false;
+  const s = String(t).trim();
+  if (!s) return false;
+  if (s === "." || s === "·") return false;
+  if (/^[\s\.\-–—]+$/.test(s)) return false;
+  return true;
+}
+
 function collectStringsDeep(obj, out, path = "", depth = 0) {
   if (depth > 12) return;
   if (obj == null) return;
@@ -208,15 +221,6 @@ function findAllStringsDeep(obj, out = [], path = "", depth = 0) {
   return out;
 }
 
-function isMeaningfulText(t) {
-  if (!t) return false;
-  const s = String(t).trim();
-  if (!s) return false;
-  if (s === "." || s === "·") return false;
-  if (/^[\s\.\-–—]+$/.test(s)) return false;
-  return true;
-}
-
 /* ---------------- Surface summary ---------------- */
 
 function getSurfaceSummary(block) {
@@ -244,17 +248,20 @@ function getSurfaceSummary(block) {
   return { count, texts: uniq };
 }
 
-/* ---------------- Paragraph / Text extraction ---------------- */
+/* ---------------- Text extraction ---------------- */
 
 function extractParagraphText(block) {
+  // simple
   if (typeof block?.["prop:text"] === "string") return block["prop:text"];
 
+  // if object
   const maybe = block?.["prop:text"];
   if (maybe && typeof maybe === "object") {
     const as = yValueToJS(maybe);
     if (typeof as === "string") return as;
   }
 
+  // candidates
   const candidates = [
     "prop:richText",
     "prop:delta",
@@ -278,11 +285,33 @@ function extractParagraphText(block) {
 }
 
 function isChecked(b) {
-  // variations seen across editors
   return !!(b?.["prop:checked"] ?? b?.["prop:done"] ?? b?.["prop:completed"] ?? b?.["prop:checked:bool"]);
 }
 
-/* ---------------- Blocks -> Markdown (broader) ---------------- */
+/* ---------------- Unknown flavour dump ---------------- */
+
+function dumpBlockSummary(block, maxStrings = 12) {
+  const flavour = block?.["sys:flavour"] || "unknown";
+  const type = block?.["prop:type"] || "";
+  const keys = block && typeof block === "object" ? Object.keys(block) : [];
+
+  const found = [];
+  collectStringsDeep(block, found);
+  const texts = found.map(x => x.text).filter(isMeaningfulText);
+
+  const uniq = [];
+  const seen = new Set();
+  for (const t of texts) {
+    if (seen.has(t)) continue;
+    seen.add(t);
+    uniq.push(t);
+    if (uniq.length >= maxStrings) break;
+  }
+
+  return { flavour, type, keys, texts: uniq };
+}
+
+/* ---------------- Blocks -> Markdown ---------------- */
 
 function blocksToMarkdown(blocks) {
   // Root: page si possible, sinon note
@@ -334,7 +363,7 @@ function blocksToMarkdown(blocks) {
       continue;
     }
 
-    // SURFACE (edgeless canvas elements)
+    // SURFACE (edgeless)
     if (flavour === "affine:surface") {
       const { count, texts } = getSurfaceSummary(b);
       lines.push("---");
@@ -345,7 +374,7 @@ function blocksToMarkdown(blocks) {
         lines.push(...texts.map(t => `- ${t}`));
         lines.push("");
       } else {
-        lines.push("_(pas de texte détecté dans la surface — probablement des éléments non-textuels ou non décodés)_");
+        lines.push("_(pas de texte détecté dans la surface — éléments non-textuels ou non décodés)_");
         lines.push("");
       }
       continue;
@@ -358,13 +387,17 @@ function blocksToMarkdown(blocks) {
       continue;
     }
 
-    // TODO / LIST (best effort)
-    if (flavour === "affine:todo" || flavour === "affine:list" || type === "todo") {
-      const checked = isChecked(b) ? "x" : " ";
-      const t = (extractParagraphText(b) || "").trim();
-      const label = isMeaningfulText(t) ? t : "(vide)";
-      lines.push(`- [${checked}] ${label}`);
-      lines.push("");
+    // TODO / LIST
+    if (flavour === "affine:list") {
+      if (type === "todo") {
+        const checked = isChecked(b) ? "x" : " ";
+        const t = (extractParagraphText(b) || "").trim();
+        const label = isMeaningfulText(t) ? t : "(vide)";
+        lines.push(`- [${checked}] ${label}`.trim(), "");
+      } else {
+        const t = (extractParagraphText(b) || "").trim();
+        if (isMeaningfulText(t)) lines.push(`- ${t}`, "");
+      }
       continue;
     }
 
@@ -376,15 +409,29 @@ function blocksToMarkdown(blocks) {
       continue;
     }
 
-    // Fallback: try to surface any meaningful strings
-    const hits = [];
-    collectStringsDeep(b, hits);
-    const firstFew = hits.map(x => x.text).filter(isMeaningfulText).slice(0, 5);
-    if (firstFew.length) {
+    // Fallback: afficher TOUS les flavours non gérés (si activé)
+    if (DUMP_UNKNOWN_FLAVOURS) {
+      const info = dumpBlockSummary(b, 15);
+
       lines.push("---");
-      lines.push(`## ${flavour || "unknown:block"}`);
-      lines.push(...firstFew.map(t => `- ${t}`));
+      lines.push(`## ${info.flavour}${info.type ? ` (${info.type})` : ""}`);
+      lines.push(`_id=${bid} • keys=${info.keys.length}_`);
       lines.push("");
+
+      lines.push("**keys:**");
+      lines.push(info.keys.map(k => `\`${k}\``).join(" "));
+      lines.push("");
+
+      if (info.texts.length) {
+        lines.push("**strings trouvées:**");
+        lines.push(...info.texts.map(t => `- ${t}`));
+        lines.push("");
+      } else {
+        lines.push("_(aucune string utile détectée)_");
+        lines.push("");
+      }
+
+      continue;
     }
   }
 
@@ -395,6 +442,7 @@ function blocksToMarkdown(blocks) {
       rootId,
       orderedCount: ordered.length,
       blocksCount: Object.keys(blocks).length,
+      dumpUnknownFlavours: DUMP_UNKNOWN_FLAVOURS,
     },
   };
 }
@@ -450,7 +498,6 @@ function findPageRefs(blocks) {
 /* ---------------- Snapshot fetcher ---------------- */
 
 async function fetchSnapshotBlobBase64(conn, wid, pid) {
-  // snapshots.guid == workspace_pages.page_id
   return await psqlQuery(
     conn,
     `SELECT encode(blob,'base64')
