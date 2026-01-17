@@ -35,6 +35,7 @@ function sshConnect() {
     conn.on("ready", () => resolve(conn));
     conn.on("error", reject);
 
+    /** @type {any} */
     const cfg = { host, port, username, readyTimeout: 15000 };
 
     if (keyPath) {
@@ -75,7 +76,7 @@ async function psqlQuery(conn, sql) {
   return stdout.trim();
 }
 
-/* ---------------- YJS -> JSON-like (improved) ---------------- */
+/* ---------------- YJS -> JSON-like ---------------- */
 
 function yValueToJS(v) {
   if (v == null) return v;
@@ -98,7 +99,7 @@ function yValueToJS(v) {
     return v.toString();
   }
 
-  // Yjs XML types (often used by rich text editors)
+  // Yjs XML types (rich text)
   if (v instanceof Y.XmlText) return v.toString();
   if (v instanceof Y.XmlFragment) return v.toString();
   if (v instanceof Y.XmlElement) return v.toString();
@@ -128,6 +129,8 @@ function decodeSnapshotToBlocks(blobBytes) {
 
   return blocks;
 }
+
+/* ---------------- Tree helpers ---------------- */
 
 function findRootPageBlock(blocks) {
   for (const [bid, b] of Object.entries(blocks)) {
@@ -162,10 +165,10 @@ function orderedBlockIds(blocks, rootId) {
   return ordered;
 }
 
-/* ---------------- Deep string extraction utilities ---------------- */
+/* ---------------- Deep scan utilities ---------------- */
 
 function collectStringsDeep(obj, out, path = "", depth = 0) {
-  if (depth > 10) return;
+  if (depth > 12) return;
   if (obj == null) return;
 
   if (typeof obj === "string") {
@@ -186,31 +189,35 @@ function collectStringsDeep(obj, out, path = "", depth = 0) {
   }
 }
 
-function findTextLikeFields(obj, hits = [], path = "", depth = 0) {
-  if (depth > 12) return hits;
-  if (!obj) return hits;
+function findAllStringsDeep(obj, out = [], path = "", depth = 0) {
+  if (depth > 12 || obj == null) return out;
 
   if (typeof obj === "string") {
-    const s = obj.trim();
-    if (s && s !== ".") hits.push({ path, value: s });
-    return hits;
+    out.push({ path, value: obj });
+    return out;
   }
-
   if (Array.isArray(obj)) {
-    obj.forEach((v, i) => findTextLikeFields(v, hits, `${path}[${i}]`, depth + 1));
-    return hits;
+    obj.forEach((v, i) => findAllStringsDeep(v, out, `${path}[${i}]`, depth + 1));
+    return out;
   }
-
   if (typeof obj === "object") {
     for (const [k, v] of Object.entries(obj)) {
-      findTextLikeFields(v, hits, path ? `${path}.${k}` : k, depth + 1);
+      findAllStringsDeep(v, out, path ? `${path}.${k}` : k, depth + 1);
     }
   }
-
-  return hits;
+  return out;
 }
 
-/* ---------------- SURFACE summary ---------------- */
+function isMeaningfulText(t) {
+  if (!t) return false;
+  const s = String(t).trim();
+  if (!s) return false;
+  if (s === "." || s === "·") return false;
+  if (/^[\s\.\-–—]+$/.test(s)) return false;
+  return true;
+}
+
+/* ---------------- Surface summary ---------------- */
 
 function getSurfaceSummary(block) {
   const val = block?.["prop:elements"]?.value;
@@ -231,26 +238,23 @@ function getSurfaceSummary(block) {
     if (seen.has(t)) continue;
     seen.add(t);
     uniq.push(t);
-    if (uniq.length >= 15) break;
+    if (uniq.length >= 20) break;
   }
 
   return { count, texts: uniq };
 }
 
-/* ---------------- Paragraph extraction (improved) ---------------- */
+/* ---------------- Paragraph / Text extraction ---------------- */
 
 function extractParagraphText(block) {
-  // 1) legacy simple text
   if (typeof block?.["prop:text"] === "string") return block["prop:text"];
 
-  // 2) if it's an object, try to convert via yValueToJS
   const maybe = block?.["prop:text"];
   if (maybe && typeof maybe === "object") {
     const as = yValueToJS(maybe);
     if (typeof as === "string") return as;
   }
 
-  // 3) common richer fields
   const candidates = [
     "prop:richText",
     "prop:delta",
@@ -258,7 +262,6 @@ function extractParagraphText(block) {
     "prop:markdown",
     "prop:html",
     "prop:source",
-    "prop:elements",
   ];
 
   for (const k of candidates) {
@@ -267,16 +270,22 @@ function extractParagraphText(block) {
     if (typeof as === "string" && as.trim()) return as;
   }
 
-  // 4) last resort: deep scan for any meaningful string
+  // last resort: deep scan
   const hits = [];
   collectStringsDeep(block, hits);
-  const first = hits.map(x => x.text).find(s => s && s !== ".");
+  const first = hits.map(x => x.text).find(s => isMeaningfulText(s));
   return first || "";
 }
 
-/* ---------------- Blocks -> Markdown ---------------- */
+function isChecked(b) {
+  // variations seen across editors
+  return !!(b?.["prop:checked"] ?? b?.["prop:done"] ?? b?.["prop:completed"] ?? b?.["prop:checked:bool"]);
+}
+
+/* ---------------- Blocks -> Markdown (broader) ---------------- */
 
 function blocksToMarkdown(blocks) {
+  // Root: page si possible, sinon note
   let rootId = findRootPageBlock(blocks);
 
   if (rootId) {
@@ -311,7 +320,9 @@ function blocksToMarkdown(blocks) {
   for (const bid of ordered) {
     const b = blocks[bid] || {};
     const flavour = b["sys:flavour"];
+    const type = b["prop:type"];
 
+    // NOTE container (edgeless)
     if (flavour === "affine:note") {
       const idx = b["prop:index"] ?? "";
       const xywh = b["prop:xywh"] ?? "";
@@ -323,6 +334,7 @@ function blocksToMarkdown(blocks) {
       continue;
     }
 
+    // SURFACE (edgeless canvas elements)
     if (flavour === "affine:surface") {
       const { count, texts } = getSurfaceSummary(b);
       lines.push("---");
@@ -333,16 +345,46 @@ function blocksToMarkdown(blocks) {
         lines.push(...texts.map(t => `- ${t}`));
         lines.push("");
       } else {
-        lines.push("_(pas de texte détecté dans la surface)_");
+        lines.push("_(pas de texte détecté dans la surface — probablement des éléments non-textuels ou non décodés)_");
         lines.push("");
       }
       continue;
     }
 
+    // PARAGRAPH
     if (flavour === "affine:paragraph") {
       const t = (extractParagraphText(b) || "").trim();
-      if (t && t !== ".") lines.push(t, "");
+      if (isMeaningfulText(t)) lines.push(t, "");
       continue;
+    }
+
+    // TODO / LIST (best effort)
+    if (flavour === "affine:todo" || flavour === "affine:list" || type === "todo") {
+      const checked = isChecked(b) ? "x" : " ";
+      const t = (extractParagraphText(b) || "").trim();
+      const label = isMeaningfulText(t) ? t : "(vide)";
+      lines.push(`- [${checked}] ${label}`);
+      lines.push("");
+      continue;
+    }
+
+    // CODE (best effort)
+    if (flavour === "affine:code") {
+      const lang = (b["prop:language"] || b["prop:lang"] || "").toString();
+      const code = (b["prop:text"] || extractParagraphText(b) || "").toString();
+      lines.push("```" + lang, code, "```", "");
+      continue;
+    }
+
+    // Fallback: try to surface any meaningful strings
+    const hits = [];
+    collectStringsDeep(b, hits);
+    const firstFew = hits.map(x => x.text).filter(isMeaningfulText).slice(0, 5);
+    if (firstFew.length) {
+      lines.push("---");
+      lines.push(`## ${flavour || "unknown:block"}`);
+      lines.push(...firstFew.map(t => `- ${t}`));
+      lines.push("");
     }
   }
 
@@ -357,70 +399,58 @@ function blocksToMarkdown(blocks) {
   };
 }
 
-/* ---------------- Reference finder (clickable docs/pages) ---------------- */
+/* ---------------- Reference finder (DEEP) ---------------- */
 
 function findPageRefs(blocks) {
   const refs = [];
-
-  const directKeys = [
-    "pageId",
-    "docId",
-    "refId",
-    "prop:pageId",
-    "prop:docId",
-    "prop:reference",
-    "prop:ref",
-    "prop:linkedPageId",
-    "prop:sourceId",
-    "prop:targetId",
-    "prop:targetPageId",
-  ];
+  const seen = new Set();
 
   for (const [id, b] of Object.entries(blocks)) {
     if (!b || typeof b !== "object") continue;
 
     const flavour = b["sys:flavour"];
     const type = b["prop:type"];
+    const strings = findAllStringsDeep(b);
 
-    for (const k of directKeys) {
-      const v = b[k];
-      if (typeof v === "string" && v.length >= 6) {
-        refs.push({ block_id: id, flavour, type, key: k, value: v });
+    for (const s of strings) {
+      const v = (s.value || "").trim();
+      if (!v) continue;
+
+      // affine:// links
+      if (v.startsWith("affine://")) {
+        const sig = `${id}|${s.path}|${v}`;
+        if (!seen.has(sig)) {
+          seen.add(sig);
+          refs.push({ block_id: id, flavour, type, key: s.path, value: v });
+        }
+        continue;
       }
-    }
 
-    for (const [k, v] of Object.entries(b)) {
-      if (!v || typeof v !== "object" || Array.isArray(v)) continue;
-      for (const [kk, vv] of Object.entries(v)) {
-        if (typeof vv !== "string") continue;
-        const low = kk.toLowerCase();
-        if (low.includes("page") || low.includes("doc") || low.includes("ref") || low.includes("guid")) {
-          refs.push({ block_id: id, flavour, type, key: `${k}.${kk}`, value: vv });
+      // heuristics: short ids / uuids often used by pages/docs
+      const looksLikeShortId = /^[A-Za-z0-9_-]{8,24}$/.test(v);
+      const looksLikeUUID =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+
+      if (looksLikeShortId || looksLikeUUID) {
+        const lowPath = s.path.toLowerCase();
+        if (lowPath.includes("page") || lowPath.includes("doc") || lowPath.includes("ref") || lowPath.includes("guid")) {
+          const sig = `${id}|${s.path}|${v}`;
+          if (!seen.has(sig)) {
+            seen.add(sig);
+            refs.push({ block_id: id, flavour, type, key: s.path, value: v });
+          }
         }
       }
     }
-
-    for (const [k, v] of Object.entries(b)) {
-      if (typeof v === "string" && v.startsWith("affine://")) {
-        refs.push({ block_id: id, flavour, type, key: k, value: v });
-      }
-    }
   }
 
-  const seen = new Set();
-  const out = [];
-  for (const r of refs) {
-    const sig = `${r.block_id}|${r.key}|${r.value}`;
-    if (seen.has(sig)) continue;
-    seen.add(sig);
-    out.push(r);
-  }
-  return out;
+  return refs;
 }
 
 /* ---------------- Snapshot fetcher ---------------- */
 
 async function fetchSnapshotBlobBase64(conn, wid, pid) {
+  // snapshots.guid == workspace_pages.page_id
   return await psqlQuery(
     conn,
     `SELECT encode(blob,'base64')
@@ -496,6 +526,7 @@ app.get("/api/workspaces/:wid/pages/:pid/content", async (req, res) => {
     const blobBytes = Buffer.from(b64, "base64");
     const blocks = decodeSnapshotToBlocks(blobBytes);
     const decoded = blocksToMarkdown(blocks);
+    const refs = findPageRefs(blocks);
 
     res.json({
       workspace_id: wid,
@@ -503,6 +534,7 @@ app.get("/api/workspaces/:wid/pages/:pid/content", async (req, res) => {
       bytes: blobBytes.length,
       title: decoded.title,
       markdown: decoded.markdown,
+      refs,
       debug: decoded.debug,
     });
   } catch (e) {
@@ -544,7 +576,106 @@ app.get("/api/workspaces/:wid/pages/:pid/raw", async (req, res) => {
   }
 });
 
-// DEBUG: inspect a specific block and find hidden/rich text
+/* ---------------- NEW: stats (flavours) ---------------- */
+
+app.get("/api/workspaces/:wid/pages/:pid/stats", async (req, res) => {
+  let conn;
+  try {
+    conn = await sshConnect();
+    const { wid, pid } = req.params;
+
+    const b64 = await fetchSnapshotBlobBase64(conn, wid, pid);
+    if (!b64) return res.status(404).json({ error: "No snapshot found" });
+
+    const blocks = decodeSnapshotToBlocks(Buffer.from(b64, "base64"));
+
+    const byFlavour = {};
+    for (const b of Object.values(blocks)) {
+      const f = b?.["sys:flavour"] || "unknown";
+      byFlavour[f] = (byFlavour[f] || 0) + 1;
+    }
+
+    res.json({
+      workspace_id: wid,
+      page_id: pid,
+      blocksCount: Object.keys(blocks).length,
+      flavours: Object.entries(byFlavour)
+        .sort((a, b) => b[1] - a[1])
+        .map(([flavour, count]) => ({ flavour, count })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    if (conn) conn.end();
+  }
+});
+
+/* ---------------- NEW: surface overview ---------------- */
+
+function objectKeysSafe(o) {
+  if (!o || typeof o !== "object") return [];
+  return Object.keys(o);
+}
+
+app.get("/api/workspaces/:wid/pages/:pid/surface", async (req, res) => {
+  let conn;
+  try {
+    conn = await sshConnect();
+    const { wid, pid } = req.params;
+
+    const b64 = await fetchSnapshotBlobBase64(conn, wid, pid);
+    if (!b64) return res.status(404).json({ error: "No snapshot found" });
+
+    const blocks = decodeSnapshotToBlocks(Buffer.from(b64, "base64"));
+
+    const surfaces = Object.entries(blocks)
+      .filter(([_, b]) => b?.["sys:flavour"] === "affine:surface")
+      .map(([id, b]) => {
+        const v = b?.["prop:elements"]?.value;
+        return {
+          id,
+          elementsType: b?.["prop:elements"]?.type,
+          valueType: v == null ? "null" : Array.isArray(v) ? "array" : typeof v,
+          keysCount: objectKeysSafe(v).length,
+          keysSample: objectKeysSafe(v).slice(0, 50),
+          summary: getSurfaceSummary(b),
+        };
+      });
+
+    res.json({ workspace_id: wid, page_id: pid, surfaces });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    if (conn) conn.end();
+  }
+});
+
+/* ---------------- NEW: inspect one block ---------------- */
+
+function findTextLikeFields(obj, hits = [], path = "", depth = 0) {
+  if (depth > 12) return hits;
+  if (!obj) return hits;
+
+  if (typeof obj === "string") {
+    const s = obj.trim();
+    if (isMeaningfulText(s)) hits.push({ path, value: s });
+    return hits;
+  }
+
+  if (Array.isArray(obj)) {
+    obj.forEach((v, i) => findTextLikeFields(v, hits, `${path}[${i}]`, depth + 1));
+    return hits;
+  }
+
+  if (typeof obj === "object") {
+    for (const [k, v] of Object.entries(obj)) {
+      findTextLikeFields(v, hits, path ? `${path}.${k}` : k, depth + 1);
+    }
+  }
+
+  return hits;
+}
+
 app.get("/api/workspaces/:wid/pages/:pid/block/:bid", async (req, res) => {
   let conn;
   try {
@@ -559,6 +690,7 @@ app.get("/api/workspaces/:wid/pages/:pid/block/:bid", async (req, res) => {
     if (!block) return res.status(404).json({ error: "Block not found" });
 
     const hits = findTextLikeFields(block);
+
     res.json({
       workspace_id: wid,
       page_id: pid,
