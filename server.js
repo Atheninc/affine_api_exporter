@@ -7,7 +7,7 @@ import * as Y from "yjs";
 dotenv.config();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 app.use(express.static("public"));
 
 const PORT = Number(process.env.PORT || 8080);
@@ -19,7 +19,7 @@ const DUMP_UNKNOWN_FLAVOURS =
 /* ---------------- SSH / DOCKER ---------------- */
 
 function dockerPrefix() {
-  return (String(process.env.DOCKER_USE_SUDO || "false").toLowerCase() === "true")
+  return String(process.env.DOCKER_USE_SUDO || "false").toLowerCase() === "true"
     ? "sudo docker"
     : "docker";
 }
@@ -72,7 +72,7 @@ async function psqlQuery(conn, sql) {
   const db = process.env.PG_DB || "affine";
   const user = process.env.PG_USER || "affine";
 
-  const sqlEscaped = sql.replace(/"/g, '\\"');
+  const sqlEscaped = String(sql).replace(/"/g, '\\"');
   const cmd = `${docker} exec ${container} psql -U ${user} -d ${db} -A -t -F "|" -c "${sqlEscaped}"`;
 
   const { code, stdout, stderr } = await sshExec(conn, cmd);
@@ -509,6 +509,100 @@ async function fetchSnapshotBlobBase64(conn, wid, pid) {
   );
 }
 
+/* ---------------- Links helpers ---------------- */
+
+function extractTargetPageIdFromRef(value) {
+  if (!value) return null;
+  const v = String(value).trim();
+
+  // affine://... -> last id-like segment
+  if (v.startsWith("affine://")) {
+    const base = v.split(/[?#]/)[0];
+    const parts = base.split("/").filter(Boolean);
+    const last = parts[parts.length - 1];
+    if (last && /^[A-Za-z0-9_-]{8,64}$/.test(last)) return last;
+  }
+
+  // UUID brut
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) {
+    return v;
+  }
+
+  // shortId brut
+  if (/^[A-Za-z0-9_-]{8,24}$/.test(v)) {
+    return v;
+  }
+
+  return null;
+}
+
+async function fetchWorkspacePages(conn, wid) {
+  const raw = await psqlQuery(
+    conn,
+    `SELECT page_id, COALESCE(title,'') as title
+     FROM workspace_pages
+     WHERE workspace_id='${wid}'
+     ORDER BY title ASC;`
+  );
+
+  return raw
+    ? raw.split("\n").map(line => {
+        const [page_id, title] = line.split("|");
+        return { page_id, title };
+      })
+    : [];
+}
+
+/* ---------------- SQL safety helpers ---------------- */
+
+function normalizeSql(sql) {
+  return String(sql || "").replace(/\u0000/g, "").trim();
+}
+
+function isSelectOnly(sql) {
+  const s = normalizeSql(sql).toLowerCase();
+
+  // block multi-statement
+  if (s.includes(";")) return false;
+
+  // ban writes/admin ops
+  const banned = [
+    "insert ",
+    "update ",
+    "delete ",
+    "drop ",
+    "alter ",
+    "create ",
+    "truncate ",
+    "grant ",
+    "revoke ",
+    "comment ",
+    "vacuum",
+    "analyze",
+    "reindex",
+    "cluster",
+    "copy ",
+    "call ",
+    "do ",
+    "execute ",
+    "set ",
+    "show ",
+    "listen",
+    "notify",
+    "unlisten",
+    "refresh materialized",
+  ];
+  if (banned.some(k => s.includes(k))) return false;
+
+  return s.startsWith("select ") || s.startsWith("with ");
+}
+
+function enforceLimit(sql, maxRows = 200) {
+  const s = normalizeSql(sql);
+  if (/\blimit\b/i.test(s)) return s;
+  return `${s} LIMIT ${maxRows}`;
+}
+
 /* ---------------- API ---------------- */
 
 app.get("/api/workspaces", async (_req, res) => {
@@ -562,8 +656,6 @@ app.get("/api/db/tables-simple", async (_req, res) => {
   }
 });
 
-
-
 /* ---------------- NEW: list db tables ---------------- */
 
 app.get("/api/db/tables", async (req, res) => {
@@ -571,20 +663,13 @@ app.get("/api/db/tables", async (req, res) => {
   try {
     conn = await sshConnect();
 
-    // Query params optionnels
-    const includeViews =
-      String(req.query.views || "false").toLowerCase() === "true";
-    const includeSystemSchemas =
-      String(req.query.system || "false").toLowerCase() === "true";
+    const includeViews = String(req.query.views || "false").toLowerCase() === "true";
+    const includeSystemSchemas = String(req.query.system || "false").toLowerCase() === "true";
 
-    // Filtre des schémas système par défaut
     const schemaFilter = includeSystemSchemas
       ? "1=1"
       : `n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'`;
 
-    // On liste les relations utiles: tables + (optionnel) vues matérialisées/vues
-    // relkind:
-    //   r = table, p = partitioned table, v = view, m = materialized view, f = foreign table
     const relKinds = includeViews ? "('r','p','v','m','f')" : "('r','p')";
 
     const raw = await psqlQuery(
@@ -629,6 +714,56 @@ app.get("/api/db/tables", async (req, res) => {
   }
 });
 
+/* ---------------- NEW: SQL query (READ ONLY) ---------------- */
+/**
+ * POST /api/db/query
+ * Body: { sql: "SELECT ...", maxRows?: 200 }
+ * Header (recommended): x-sql-token: <SQL_API_TOKEN>
+ */
+app.post("/api/db/query", async (req, res) => {
+  let conn;
+  try {
+    const tokenExpected = process.env.SQL_API_TOKEN;
+    if (tokenExpected) {
+      const tokenGot = String(req.headers["x-sql-token"] || "");
+      if (tokenGot !== tokenExpected) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+    }
+
+    const sqlRaw = req.body?.sql;
+    if (!sqlRaw) return res.status(400).json({ error: "Missing body.sql" });
+
+    const sql = normalizeSql(sqlRaw);
+
+    if (!isSelectOnly(sql)) {
+      return res.status(400).json({
+        error: "Only single-statement read-only SELECT/CTE queries are allowed (no ';', no write/admin ops).",
+      });
+    }
+
+    const maxRows = Math.min(Math.max(Number(req.body?.maxRows || 200), 1), 2000);
+    const finalSql = enforceLimit(sql, maxRows);
+
+    conn = await sshConnect();
+    const raw = await psqlQuery(conn, finalSql);
+
+    const rows = raw ? raw.split("\n").map(line => line.split("|")) : [];
+
+    res.json({
+      db: process.env.PG_DB || "affine",
+      maxRows,
+      sql: finalSql,
+      rowCount: rows.length,
+      rows,
+      raw,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    if (conn) conn.end();
+  }
+});
 
 app.get("/api/workspaces/:wid/pages", async (req, res) => {
   let conn;
@@ -652,6 +787,75 @@ app.get("/api/workspaces/:wid/pages", async (req, res) => {
       : [];
 
     res.json({ workspace_id: wid, pages });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    if (conn) conn.end();
+  }
+});
+
+/* ---------------- NEW: bidirectional page links ---------------- */
+/**
+ * GET /api/workspaces/:wid/pages/:pid/links
+ * Query params:
+ *   - scanLimit: number (0 = all pages)
+ */
+app.get("/api/workspaces/:wid/pages/:pid/links", async (req, res) => {
+  let conn;
+  try {
+    conn = await sshConnect();
+    const { wid, pid } = req.params;
+    const scanLimit = Number(req.query.scanLimit || 0);
+
+    const pages = await fetchWorkspacePages(conn, wid);
+    const scanPages = scanLimit > 0 ? pages.slice(0, scanLimit) : pages;
+
+    // OUTGOING
+    let outgoing = [];
+    {
+      const b64 = await fetchSnapshotBlobBase64(conn, wid, pid);
+      if (!b64) return res.status(404).json({ error: "No snapshot found" });
+
+      const blocks = decodeSnapshotToBlocks(Buffer.from(b64, "base64"));
+      outgoing = findPageRefs(blocks).map(r => ({
+        ...r,
+        target_page_id: extractTargetPageIdFromRef(r.value),
+      }));
+    }
+
+    // INCOMING (backlinks)
+    const incoming = [];
+    for (const p of scanPages) {
+      if (p.page_id === pid) continue;
+
+      const b64 = await fetchSnapshotBlobBase64(conn, wid, p.page_id);
+      if (!b64) continue;
+
+      const blocks = decodeSnapshotToBlocks(Buffer.from(b64, "base64"));
+      const refs = findPageRefs(blocks);
+
+      const matchedRef = refs.find(r => extractTargetPageIdFromRef(r.value) === pid);
+      if (matchedRef) {
+        incoming.push({
+          page_id: p.page_id,
+          title: p.title,
+          via: matchedRef.value,
+          block_id: matchedRef.block_id,
+          key: matchedRef.key,
+        });
+      }
+    }
+
+    res.json({
+      workspace_id: wid,
+      page_id: pid,
+      outgoing_count: outgoing.length,
+      incoming_count: incoming.length,
+      outgoing,
+      incoming,
+      scanned_pages: scanPages.length,
+      total_pages: pages.length,
+    });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   } finally {
