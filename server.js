@@ -532,36 +532,6 @@ app.get("/api/workspaces", async (_req, res) => {
   }
 });
 
-app.get("/api/db/tables-simple", async (_req, res) => {
-  let conn;
-  try {
-    conn = await sshConnect();
-    const raw = await psqlQuery(
-      conn,
-      `
-      SELECT table_schema, table_name
-      FROM information_schema.tables
-      WHERE table_type='BASE TABLE'
-        AND table_schema NOT IN ('pg_catalog','information_schema')
-      ORDER BY table_schema, table_name;
-      `
-    );
-
-    const tables = raw
-      ? raw.split("\n").map(line => {
-          const [schema, name] = line.split("|");
-          return { schema, name };
-        })
-      : [];
-
-    res.json({ count: tables.length, tables });
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  } finally {
-    if (conn) conn.end();
-  }
-});
-
 
 
 /* ---------------- NEW: list db tables ---------------- */
