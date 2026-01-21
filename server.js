@@ -14,351 +14,351 @@ const PORT = Number(process.env.PORT || 8080);
 
 // Active le dump des blocks inconnus dans /content
 const DUMP_UNKNOWN_FLAVOURS =
-    String(process.env.DUMP_UNKNOWN_FLAVOURS || "false").toLowerCase() === "true";
+  String(process.env.DUMP_UNKNOWN_FLAVOURS || "false").toLowerCase() === "true";
 
 /* ---------------- SSH / DOCKER ---------------- */
 
 function dockerPrefix() {
-    return (String(process.env.DOCKER_USE_SUDO || "false").toLowerCase() === "true") ?
-        "sudo docker" :
-        "docker";
+  return (String(process.env.DOCKER_USE_SUDO || "false").toLowerCase() === "true")
+    ? "sudo docker"
+    : "docker";
 }
 
 function sshConnect() {
-    const host = process.env.VPS_HOST;
-    const port = Number(process.env.VPS_PORT || 22);
-    const username = process.env.VPS_USER || "root";
-    const password = process.env.VPS_PASS;
-    const keyPath = process.env.VPS_KEY_PATH;
+  const host = process.env.VPS_HOST;
+  const port = Number(process.env.VPS_PORT || 22);
+  const username = process.env.VPS_USER || "root";
+  const password = process.env.VPS_PASS;
+  const keyPath = process.env.VPS_KEY_PATH;
 
-    if (!host) throw new Error("VPS_HOST missing");
-    if (!password && !keyPath) throw new Error("VPS_PASS or VPS_KEY_PATH required");
+  if (!host) throw new Error("VPS_HOST missing");
+  if (!password && !keyPath) throw new Error("VPS_PASS or VPS_KEY_PATH required");
 
-    return new Promise((resolve, reject) => {
-        const conn = new SSHClient();
-        conn.on("ready", () => resolve(conn));
-        conn.on("error", reject);
+  return new Promise((resolve, reject) => {
+    const conn = new SSHClient();
+    conn.on("ready", () => resolve(conn));
+    conn.on("error", reject);
 
-        /** @type {any} */
-        const cfg = { host, port, username, readyTimeout: 15000 };
+    /** @type {any} */
+    const cfg = { host, port, username, readyTimeout: 15000 };
 
-        if (keyPath) {
-            cfg.privateKey = fs.readFileSync(keyPath);
-            if (password) cfg.passphrase = password; // clé chiffrée
-        } else {
-            cfg.password = password;
-        }
+    if (keyPath) {
+      cfg.privateKey = fs.readFileSync(keyPath);
+      if (password) cfg.passphrase = password; // clé chiffrée
+    } else {
+      cfg.password = password;
+    }
 
-        conn.connect(cfg);
-    });
+    conn.connect(cfg);
+  });
 }
 
 function sshExec(conn, command) {
-    return new Promise((resolve, reject) => {
-        conn.exec(command, (err, stream) => {
-            if (err) return reject(err);
-            let stdout = "";
-            let stderr = "";
-            stream.on("data", d => (stdout += d.toString("utf8")));
-            stream.stderr.on("data", d => (stderr += d.toString("utf8")));
-            stream.on("close", code => resolve({ code, stdout, stderr }));
-        });
+  return new Promise((resolve, reject) => {
+    conn.exec(command, (err, stream) => {
+      if (err) return reject(err);
+      let stdout = "";
+      let stderr = "";
+      stream.on("data", d => (stdout += d.toString("utf8")));
+      stream.stderr.on("data", d => (stderr += d.toString("utf8")));
+      stream.on("close", code => resolve({ code, stdout, stderr }));
     });
+  });
 }
 
 async function psqlQuery(conn, sql) {
-    const docker = dockerPrefix();
-    const container = process.env.AFFINE_PG_CONTAINER || "affine_postgres";
-    const db = process.env.PG_DB || "affine";
-    const user = process.env.PG_USER || "affine";
+  const docker = dockerPrefix();
+  const container = process.env.AFFINE_PG_CONTAINER || "affine_postgres";
+  const db = process.env.PG_DB || "affine";
+  const user = process.env.PG_USER || "affine";
 
-    const sqlEscaped = sql.replace(/"/g, '\\"');
-    const cmd = `${docker} exec ${container} psql -U ${user} -d ${db} -A -t -F "|" -c "${sqlEscaped}"`;
+  const sqlEscaped = sql.replace(/"/g, '\\"');
+  const cmd = `${docker} exec ${container} psql -U ${user} -d ${db} -A -t -F "|" -c "${sqlEscaped}"`;
 
-    const { code, stdout, stderr } = await sshExec(conn, cmd);
-    if (code !== 0) throw new Error(stderr || stdout);
-    return stdout.trim();
+  const { code, stdout, stderr } = await sshExec(conn, cmd);
+  if (code !== 0) throw new Error(stderr || stdout);
+  return stdout.trim();
 }
 
 /* ---------------- YJS -> JSON-like ---------------- */
 
 function yValueToJS(v) {
-    if (v == null) return v;
-    if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") return v;
+  if (v == null) return v;
+  if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") return v;
 
-    if (v instanceof Uint8Array) return { __bytes__: true, len: v.length };
-    if (Buffer.isBuffer(v)) return { __bytes__: true, len: v.length };
+  if (v instanceof Uint8Array) return { __bytes__: true, len: v.length };
+  if (Buffer.isBuffer(v)) return { __bytes__: true, len: v.length };
 
-    if (v instanceof Y.Map) {
-        const obj = {};
-        v.forEach((val, key) => (obj[key] = yValueToJS(val)));
-        return obj;
-    }
+  if (v instanceof Y.Map) {
+    const obj = {};
+    v.forEach((val, key) => (obj[key] = yValueToJS(val)));
+    return obj;
+  }
 
-    if (v instanceof Y.Array) {
-        return v.toArray().map(yValueToJS);
-    }
+  if (v instanceof Y.Array) {
+    return v.toArray().map(yValueToJS);
+  }
 
-    if (v instanceof Y.Text) {
-        return v.toString();
-    }
+  if (v instanceof Y.Text) {
+    return v.toString();
+  }
 
-    // Yjs XML types (rich text)
-    if (v instanceof Y.XmlText) return v.toString();
-    if (v instanceof Y.XmlFragment) return v.toString();
-    if (v instanceof Y.XmlElement) return v.toString();
+  // Yjs XML types (rich text)
+  if (v instanceof Y.XmlText) return v.toString();
+  if (v instanceof Y.XmlFragment) return v.toString();
+  if (v instanceof Y.XmlElement) return v.toString();
 
-    if (typeof v ? .toArray === "function") {
-        try {
-            return v.toArray().map(yValueToJS);
-        } catch {}
-    }
-
+  if (typeof v?.toArray === "function") {
     try {
-        return JSON.parse(JSON.stringify(v));
+      return v.toArray().map(yValueToJS);
     } catch {}
+  }
 
-    return String(v);
+  try {
+    return JSON.parse(JSON.stringify(v));
+  } catch {}
+
+  return String(v);
 }
 
 function decodeSnapshotToBlocks(blobBytes) {
-    const doc = new Y.Doc();
-    Y.applyUpdate(doc, new Uint8Array(blobBytes));
+  const doc = new Y.Doc();
+  Y.applyUpdate(doc, new Uint8Array(blobBytes));
 
-    const blocksMap = doc.getMap("blocks");
-    const blocks = {};
-    blocksMap.forEach((val, key) => {
-        blocks[key] = yValueToJS(val);
-    });
+  const blocksMap = doc.getMap("blocks");
+  const blocks = {};
+  blocksMap.forEach((val, key) => {
+    blocks[key] = yValueToJS(val);
+  });
 
-    return blocks;
+  return blocks;
 }
 
 /* ---------------- Tree helpers ---------------- */
 
 function findRootPageBlock(blocks) {
-    for (const [bid, b] of Object.entries(blocks)) {
-        if (b && b["sys:flavour"] === "affine:page") return bid;
-    }
-    return null;
+  for (const [bid, b] of Object.entries(blocks)) {
+    if (b && b["sys:flavour"] === "affine:page") return bid;
+  }
+  return null;
 }
 
 function findFirstNoteBlock(blocks) {
-    for (const [bid, b] of Object.entries(blocks)) {
-        if (b && b["sys:flavour"] === "affine:note") return bid;
-    }
-    return null;
+  for (const [bid, b] of Object.entries(blocks)) {
+    if (b && b["sys:flavour"] === "affine:note") return bid;
+  }
+  return null;
 }
 
 function orderedBlockIds(blocks, rootId) {
-    if (!rootId) return [];
-    const visited = new Set();
-    const ordered = [];
+  if (!rootId) return [];
+  const visited = new Set();
+  const ordered = [];
 
-    function walk(id) {
-        if (!id || visited.has(id)) return;
-        visited.add(id);
-        ordered.push(id);
+  function walk(id) {
+    if (!id || visited.has(id)) return;
+    visited.add(id);
+    ordered.push(id);
 
-        const b = blocks[id] || {};
-        const children = b["sys:children"] || [];
-        if (Array.isArray(children)) children.forEach(walk);
-    }
+    const b = blocks[id] || {};
+    const children = b["sys:children"] || [];
+    if (Array.isArray(children)) children.forEach(walk);
+  }
 
-    walk(rootId);
-    return ordered;
+  walk(rootId);
+  return ordered;
 }
 
 /* ---------------- Deep scan utilities ---------------- */
 
 function isMeaningfulText(t) {
-    if (!t) return false;
-    const s = String(t).trim();
-    if (!s) return false;
-    if (s === "." || s === "·") return false;
-    if (/^[\s\.\-–—]+$/.test(s)) return false;
-    return true;
+  if (!t) return false;
+  const s = String(t).trim();
+  if (!s) return false;
+  if (s === "." || s === "·") return false;
+  if (/^[\s\.\-–—]+$/.test(s)) return false;
+  return true;
 }
 
 function collectStringsDeep(obj, out, path = "", depth = 0) {
-    if (depth > 12) return;
-    if (obj == null) return;
+  if (depth > 12) return;
+  if (obj == null) return;
 
-    if (typeof obj === "string") {
-        const s = obj.trim();
-        if (s && s !== ".") out.push({ path, text: s });
-        return;
-    }
+  if (typeof obj === "string") {
+    const s = obj.trim();
+    if (s && s !== ".") out.push({ path, text: s });
+    return;
+  }
 
-    if (Array.isArray(obj)) {
-        obj.forEach((v, i) => collectStringsDeep(v, out, `${path}[${i}]`, depth + 1));
-        return;
-    }
+  if (Array.isArray(obj)) {
+    obj.forEach((v, i) => collectStringsDeep(v, out, `${path}[${i}]`, depth + 1));
+    return;
+  }
 
-    if (typeof obj === "object") {
-        for (const [k, v] of Object.entries(obj)) {
-            collectStringsDeep(v, out, path ? `${path}.${k}` : k, depth + 1);
-        }
+  if (typeof obj === "object") {
+    for (const [k, v] of Object.entries(obj)) {
+      collectStringsDeep(v, out, path ? `${path}.${k}` : k, depth + 1);
     }
+  }
 }
 
 function findAllStringsDeep(obj, out = [], path = "", depth = 0) {
-    if (depth > 12 || obj == null) return out;
+  if (depth > 12 || obj == null) return out;
 
-    if (typeof obj === "string") {
-        out.push({ path, value: obj });
-        return out;
-    }
-    if (Array.isArray(obj)) {
-        obj.forEach((v, i) => findAllStringsDeep(v, out, `${path}[${i}]`, depth + 1));
-        return out;
-    }
-    if (typeof obj === "object") {
-        for (const [k, v] of Object.entries(obj)) {
-            findAllStringsDeep(v, out, path ? `${path}.${k}` : k, depth + 1);
-        }
-    }
+  if (typeof obj === "string") {
+    out.push({ path, value: obj });
     return out;
+  }
+  if (Array.isArray(obj)) {
+    obj.forEach((v, i) => findAllStringsDeep(v, out, `${path}[${i}]`, depth + 1));
+    return out;
+  }
+  if (typeof obj === "object") {
+    for (const [k, v] of Object.entries(obj)) {
+      findAllStringsDeep(v, out, path ? `${path}.${k}` : k, depth + 1);
+    }
+  }
+  return out;
 }
 
 /* ---------------- Surface summary ---------------- */
 
 function getSurfaceSummary(block) {
-    const val = block ? .["prop:elements"] ? .value;
-    if (!val) return { count: 0, texts: [] };
+  const val = block?.["prop:elements"]?.value;
+  if (!val) return { count: 0, texts: [] };
 
-    let count = 0;
-    if (Array.isArray(val ? .elements)) count = val.elements.length;
-    else if (Array.isArray(val)) count = val.length;
-    else if (typeof val === "object") count = Object.keys(val).length;
+  let count = 0;
+  if (Array.isArray(val?.elements)) count = val.elements.length;
+  else if (Array.isArray(val)) count = val.length;
+  else if (typeof val === "object") count = Object.keys(val).length;
 
-    const found = [];
-    collectStringsDeep(val, found);
+  const found = [];
+  collectStringsDeep(val, found);
 
-    const uniq = [];
-    const seen = new Set();
-    for (const x of found) {
-        const t = x.text;
-        if (seen.has(t)) continue;
-        seen.add(t);
-        uniq.push(t);
-        if (uniq.length >= 20) break;
-    }
+  const uniq = [];
+  const seen = new Set();
+  for (const x of found) {
+    const t = x.text;
+    if (seen.has(t)) continue;
+    seen.add(t);
+    uniq.push(t);
+    if (uniq.length >= 20) break;
+  }
 
-    return { count, texts: uniq };
+  return { count, texts: uniq };
 }
 
 /* ---------------- Text extraction ---------------- */
 
 function extractParagraphText(block) {
-    // simple
-    if (typeof block ? .["prop:text"] === "string") return block["prop:text"];
+  // simple
+  if (typeof block?.["prop:text"] === "string") return block["prop:text"];
 
-    // if object
-    const maybe = block ? .["prop:text"];
-    if (maybe && typeof maybe === "object") {
-        const as = yValueToJS(maybe);
-        if (typeof as === "string") return as;
-    }
+  // if object
+  const maybe = block?.["prop:text"];
+  if (maybe && typeof maybe === "object") {
+    const as = yValueToJS(maybe);
+    if (typeof as === "string") return as;
+  }
 
-    // candidates
-    const candidates = [
-        "prop:richText",
-        "prop:delta",
-        "prop:content",
-        "prop:markdown",
-        "prop:html",
-        "prop:source",
-    ];
+  // candidates
+  const candidates = [
+    "prop:richText",
+    "prop:delta",
+    "prop:content",
+    "prop:markdown",
+    "prop:html",
+    "prop:source",
+  ];
 
-    for (const k of candidates) {
-        if (!block ? .[k]) continue;
-        const as = yValueToJS(block[k]);
-        if (typeof as === "string" && as.trim()) return as;
-    }
+  for (const k of candidates) {
+    if (!block?.[k]) continue;
+    const as = yValueToJS(block[k]);
+    if (typeof as === "string" && as.trim()) return as;
+  }
 
-    // last resort: deep scan
-    const hits = [];
-    collectStringsDeep(block, hits);
-    const first = hits.map(x => x.text).find(s => isMeaningfulText(s));
-    return first || "";
+  // last resort: deep scan
+  const hits = [];
+  collectStringsDeep(block, hits);
+  const first = hits.map(x => x.text).find(s => isMeaningfulText(s));
+  return first || "";
 }
 
 function isChecked(b) {
-    return !!(b ? .["prop:checked"] ? ? b ? .["prop:done"] ? ? b ? .["prop:completed"] ? ? b ? .["prop:checked:bool"]);
+  return !!(b?.["prop:checked"] ?? b?.["prop:done"] ?? b?.["prop:completed"] ?? b?.["prop:checked:bool"]);
 }
 
 /* ---------------- Unknown flavour dump ---------------- */
 
 function dumpBlockSummary(block, maxStrings = 12) {
-    const flavour = block ? .["sys:flavour"] || "unknown";
-    const type = block ? .["prop:type"] || "";
-    const keys = block && typeof block === "object" ? Object.keys(block) : [];
+  const flavour = block?.["sys:flavour"] || "unknown";
+  const type = block?.["prop:type"] || "";
+  const keys = block && typeof block === "object" ? Object.keys(block) : [];
 
-    const found = [];
-    collectStringsDeep(block, found);
-    const texts = found.map(x => x.text).filter(isMeaningfulText);
+  const found = [];
+  collectStringsDeep(block, found);
+  const texts = found.map(x => x.text).filter(isMeaningfulText);
 
-    const uniq = [];
-    const seen = new Set();
-    for (const t of texts) {
-        if (seen.has(t)) continue;
-        seen.add(t);
-        uniq.push(t);
-        if (uniq.length >= maxStrings) break;
-    }
+  const uniq = [];
+  const seen = new Set();
+  for (const t of texts) {
+    if (seen.has(t)) continue;
+    seen.add(t);
+    uniq.push(t);
+    if (uniq.length >= maxStrings) break;
+  }
 
-    return { flavour, type, keys, texts: uniq };
+  return { flavour, type, keys, texts: uniq };
 }
 
 /* ---------------- Blocks -> Markdown ---------------- */
 
 function blocksToMarkdown(blocks) {
-    // Root: page si possible, sinon note
-    let rootId = findRootPageBlock(blocks);
+  // Root: page si possible, sinon note
+  let rootId = findRootPageBlock(blocks);
 
-    if (rootId) {
-        const rootChildren = blocks[rootId] ? .["sys:children"];
-        const hasChildren = Array.isArray(rootChildren) && rootChildren.length > 0;
-        if (!hasChildren) {
-            const noteId = findFirstNoteBlock(blocks);
-            if (noteId) rootId = noteId;
-        }
-    } else {
-        const noteId = findFirstNoteBlock(blocks);
-        if (noteId) rootId = noteId;
+  if (rootId) {
+    const rootChildren = blocks[rootId]?.["sys:children"];
+    const hasChildren = Array.isArray(rootChildren) && rootChildren.length > 0;
+    if (!hasChildren) {
+      const noteId = findFirstNoteBlock(blocks);
+      if (noteId) rootId = noteId;
     }
+  } else {
+    const noteId = findFirstNoteBlock(blocks);
+    if (noteId) rootId = noteId;
+  }
 
-    let pageTitle = "Untitled";
-    if (rootId) {
-        const maybeTitle = blocks[rootId] ? .["prop:title"];
-        if (typeof maybeTitle === "string" && maybeTitle.trim()) pageTitle = maybeTitle.trim();
-    }
+  let pageTitle = "Untitled";
+  if (rootId) {
+    const maybeTitle = blocks[rootId]?.["prop:title"];
+    if (typeof maybeTitle === "string" && maybeTitle.trim()) pageTitle = maybeTitle.trim();
+  }
 
-    if (!rootId) {
-        return {
-            title: "Untitled",
-            markdown: "_No affine:page / affine:note root found_",
-            debug: { blocksCount: Object.keys(blocks).length },
-        };
-    }
+  if (!rootId) {
+    return {
+      title: "Untitled",
+      markdown: "_No affine:page / affine:note root found_",
+      debug: { blocksCount: Object.keys(blocks).length },
+    };
+  }
 
-    const ordered = orderedBlockIds(blocks, rootId);
-    const lines = [`# ${pageTitle || "Untitled"}`, ""];
+  const ordered = orderedBlockIds(blocks, rootId);
+  const lines = [`# ${pageTitle || "Untitled"}`, ""];
 
-    for (const bid of ordered) {
-        const b = blocks[bid] || {};
-        const flavour = b["sys:flavour"];
-        const type = b["prop:type"];
+  for (const bid of ordered) {
+    const b = blocks[bid] || {};
+    const flavour = b["sys:flavour"];
+    const type = b["prop:type"];
 
-        // NOTE container (edgeless)
-        if (flavour === "affine:note") {
-            const idx = b["prop:index"] ? ? "";
-            const xywh = b["prop:xywh"] ? ? "";
-            const hidden = b["prop:hidden"] ? "hidden" : "visible";
-            lines.push("---");
-            lines.push(`## Note ${idx}`.trim());
-            lines.push(`_${hidden}${xywh ? ` • xywh=${xywh}` : ""}_`);
+    // NOTE container (edgeless)
+    if (flavour === "affine:note") {
+      const idx = b["prop:index"] ?? "";
+      const xywh = b["prop:xywh"] ?? "";
+      const hidden = b["prop:hidden"] ? "hidden" : "visible";
+      lines.push("---");
+      lines.push(`## Note ${idx}`.trim());
+      lines.push(`_${hidden}${xywh ? ` • xywh=${xywh}` : ""}_`);
       lines.push("");
       continue;
     }
