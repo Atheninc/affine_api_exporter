@@ -532,74 +532,6 @@ app.get("/api/workspaces", async (_req, res) => {
   }
 });
 
-
-
-/* ---------------- NEW: list db tables ---------------- */
-
-app.get("/api/db/tables", async (req, res) => {
-  let conn;
-  try {
-    conn = await sshConnect();
-
-    // Query params optionnels
-    const includeViews =
-      String(req.query.views || "false").toLowerCase() === "true";
-    const includeSystemSchemas =
-      String(req.query.system || "false").toLowerCase() === "true";
-
-    // Filtre des schémas système par défaut
-    const schemaFilter = includeSystemSchemas
-      ? "1=1"
-      : `n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'`;
-
-    // On liste les relations utiles: tables + (optionnel) vues matérialisées/vues
-    // relkind:
-    //   r = table, p = partitioned table, v = view, m = materialized view, f = foreign table
-    const relKinds = includeViews ? "('r','p','v','m','f')" : "('r','p')";
-
-    const raw = await psqlQuery(
-      conn,
-      `
-      SELECT
-        n.nspname AS schema,
-        c.relname AS name,
-        CASE c.relkind
-          WHEN 'r' THEN 'table'
-          WHEN 'p' THEN 'partitioned_table'
-          WHEN 'v' THEN 'view'
-          WHEN 'm' THEN 'materialized_view'
-          WHEN 'f' THEN 'foreign_table'
-          ELSE c.relkind::text
-        END AS kind
-      FROM pg_class c
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind IN ${relKinds}
-        AND ${schemaFilter}
-      ORDER BY n.nspname, c.relname;
-      `
-    );
-
-    const items = raw
-      ? raw.split("\n").map(line => {
-          const [schema, name, kind] = line.split("|");
-          return { schema, name, kind };
-        })
-      : [];
-
-    res.json({
-      db: process.env.PG_DB || "affine",
-      container: process.env.AFFINE_PG_CONTAINER || "affine_postgres",
-      count: items.length,
-      tables: items,
-    });
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  } finally {
-    if (conn) conn.end();
-  }
-});
-
-
 app.get("/api/workspaces/:wid/pages", async (req, res) => {
   let conn;
   try {
@@ -608,7 +540,7 @@ app.get("/api/workspaces/:wid/pages", async (req, res) => {
 
     const raw = await psqlQuery(
       conn,
-      `SELECT page_id, title, mode, public, blocked
+      `SELECT *
        FROM workspace_pages
        WHERE workspace_id='${wid}'
        ORDER BY title ASC;`
